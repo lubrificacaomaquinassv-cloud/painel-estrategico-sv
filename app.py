@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import unicodedata
 
-PAINEL_BUILD = "2026-07-24-sem-colheitadeira-v8"
+PAINEL_BUILD = "2026-07-24-periodo-padrao-v9"
 MES_INICIO_COLETA = "2026-05"  # início apontamento_campo
 LIMITE_OUTLIER_CUSTO = 50000.0  # ex.: motor R$ 91k — fora dos gráficos rotineiros
 BG_URL = "https://media.bio.site/sites/32a25c2c-d6fa-4dfc-bdc2-27e4d35d7ea2/AhS9mKiQxFRXAyMBdXDzEG.jpg"
@@ -554,7 +554,9 @@ def montar_rank_tratores(df_disp_m, df_abast_m=None, df_abast_s500=None):
     r = df_disp_m.copy()
     r["label"] = r.apply(label_trator, axis=1)
     r["label_curto"] = r.apply(label_curto, axis=1)
-    if df_abast_m is not None and not df_abast_m.empty:
+    if "litros_uso" in r.columns:
+        r["litros"] = pd.to_numeric(r["litros_uso"], errors="coerce").fillna(0)
+    elif df_abast_m is not None and not df_abast_m.empty:
         r = r.merge(
             df_abast_m[["id_frota", "litros_total"]].rename(columns={"litros_total": "litros"}),
             on="id_frota", how="left",
@@ -580,6 +582,51 @@ def montar_rank_tratores(df_disp_m, df_abast_m=None, df_abast_s500=None):
         axis=1,
     )
     return r[mask].copy()
+
+
+def cruzamento_combustivel(df_disp_m, df_abast_m=None):
+    """Cruzamento litros × horas — mês único ou período agregado."""
+    if df_disp_m.empty:
+        return pd.DataFrame()
+    if "litros_uso" in df_disp_m.columns and pd.to_numeric(df_disp_m["litros_uso"], errors="coerce").fillna(0).sum() > 0:
+        cruz = df_disp_m[df_disp_m["horas_trabalhadas"] > 0].copy()
+        cruz["litros_total"] = pd.to_numeric(cruz["litros_uso"], errors="coerce").fillna(0)
+    elif df_abast_m is not None and not df_abast_m.empty:
+        ab = df_abast_m.groupby("id_frota", as_index=False)["litros_total"].sum()
+        cruz = df_disp_m.merge(ab, on="id_frota", how="inner")
+    else:
+        return pd.DataFrame()
+    if "litros_h" not in cruz.columns:
+        cruz["litros_h"] = cruz.apply(
+            lambda r: r["litros_total"] / r["horas_trabalhadas"] if r["horas_trabalhadas"] > 0 else 0,
+            axis=1,
+        )
+    cruz["label"] = cruz.apply(
+        lambda r: label_trator({"id_frota": r["id_frota"], "modelo": r.get("modelo", "")}),
+        axis=1,
+    )
+    return cruz
+
+
+def prep_dados_escopo(df_disp, df_os, df_pecas, df_lanc, df_abast, df_abast_det, meses_ativos):
+    """Agrega por frota (período) ou filtra um mês."""
+    meses_ativos = [str(m) for m in meses_ativos]
+    df_abast_s500 = abast_s500_periodo(df_abast_det, meses_ativos)
+    if len(meses_ativos) > 1:
+        df_disp_m = agg_frota_trimestre(df_disp, df_abast, df_abast_s500, meses_ativos)
+        df_os_m = filtrar_cat(df_os[df_os["mes_key"].astype(str).isin(meses_ativos)].copy()) if not df_os.empty else pd.DataFrame()
+        df_pecas_m = filtrar_cat(df_pecas[df_pecas["mes_key"].astype(str).isin(meses_ativos)]) if not df_pecas.empty else pd.DataFrame()
+        df_lanc_m = filtrar_cat(df_lanc[df_lanc["mes_key"].astype(str).isin(meses_ativos)]) if not df_lanc.empty else pd.DataFrame()
+        df_abast_m = filtrar_cat(df_abast[df_abast["mes_key"].astype(str).isin(meses_ativos)]) if not df_abast.empty else pd.DataFrame()
+    else:
+        mk = meses_ativos[0]
+        df_disp_m = filtrar_cat(df_disp[df_disp["mes_key"] == mk]) if not df_disp.empty else pd.DataFrame()
+        df_os_m = filtrar_cat(df_os[df_os["mes_key"] == mk].copy()) if not df_os.empty else pd.DataFrame()
+        df_pecas_m = filtrar_cat(df_pecas[df_pecas["mes_key"] == mk]) if not df_pecas.empty else pd.DataFrame()
+        df_lanc_m = filtrar_cat(df_lanc[df_lanc["mes_key"] == mk]) if not df_lanc.empty else pd.DataFrame()
+        df_abast_m = filtrar_cat(df_abast[df_abast["mes_key"] == mk]) if not df_abast.empty else pd.DataFrame()
+        df_abast_s500 = abast_s500_mes(df_abast_det, mk)
+    return df_disp_m, df_os_m, df_pecas_m, df_lanc_m, df_abast_m, df_abast_s500
 
 
 def chart_top5(df, col, titulo, cor, fmt_fn=None, orientation="h"):
@@ -1162,14 +1209,40 @@ with st.sidebar:
             n=6,
         )
         meses_opts = [m for m in meses_opts if m >= MES_INICIO_COLETA] or [mes_atual_str]
-    mes_sel = st.selectbox(
-        "Mês de referência",
-        options=meses_opts,
+    trimestres_opts = periodos_resumo_disponiveis(meses_opts)
+    if not trimestres_opts:
+        trimestres_opts = [{"id": "2026-maijunjul", "label": fmt_periodo_label("2026-maijunjul"), "meses": meses_opts[:3]}]
+    periodo_sel = st.selectbox(
+        "Período (resumo)",
+        options=[p["id"] for p in trimestres_opts],
         index=0,
-        format_func=fmt_mes_label,
-        key="mes_sel",
+        format_func=lambda pid: next(p["label"] for p in trimestres_opts if p["id"] == pid),
+        key="periodo_sel",
     )
-    n_meses_trend = st.slider("Meses no gráfico de tendência", 3, 12, 6, key="n_trend")
+    meses_tri = meses_do_periodo(periodo_sel, set(meses_opts))
+    modo_visao = st.radio(
+        "Escopo dos indicadores",
+        ["Período Mai–Jun–Jul", "Detalhe por mês"],
+        index=0,
+        horizontal=True,
+        key="modo_visao",
+    )
+    if modo_visao.startswith("Detalhe"):
+        mes_sel = st.selectbox(
+            "Mês de referência",
+            options=meses_opts,
+            index=0,
+            format_func=fmt_mes_label,
+            key="mes_sel",
+        )
+        meses_ativos = [mes_sel]
+        titulo_periodo = fmt_mes_label(mes_sel)
+    else:
+        mes_sel = meses_tri[-1] if meses_tri else meses_opts[0]
+        meses_ativos = meses_tri
+        titulo_periodo = fmt_periodo_label(periodo_sel)
+    escopo_periodo = len(meses_ativos) > 1
+    n_meses_trend = st.slider("Meses no gráfico de tendência", 3, 12, len(meses_tri) or 6, key="n_trend")
     categorias = sorted(
         {str(c) for c in df_disp["categoria_painel"].dropna().unique()
          if "COLHEIT" not in str(c).upper()}
@@ -1183,18 +1256,8 @@ with st.sidebar:
         key="cat_sel",
     )
     st.caption(
-        f"Coleta desde {fmt_mes_label(MES_INICIO_COLETA)} · "
-        f"Colheitadeiras excluídas · tratores produtivos + MO mecânico"
-    )
-    trimestres_opts = periodos_resumo_disponiveis(meses_opts)
-    if not trimestres_opts:
-        trimestres_opts = [{"id": "2026-maijunjul", "label": fmt_periodo_label("2026-maijunjul"), "meses": meses_opts[:3]}]
-    periodo_sel = st.selectbox(
-        "Período (resumo)",
-        options=[p["id"] for p in trimestres_opts],
-        index=0,
-        format_func=lambda pid: next(p["label"] for p in trimestres_opts if p["id"] == pid),
-        key="periodo_sel",
+        f"Coleta {fmt_periodo_label('2026-maijunjul')} · "
+        f"Visão: {titulo_periodo} · colheitadeiras excluídas"
     )
     preco_s500 = st.number_input(
         "Preço médio S-500 (R$/L)",
@@ -1209,17 +1272,14 @@ def filtrar_cat(df, col="categoria_painel"):
         return df
     return df[df[col].astype(str).isin(cat_sel)]
 
-df_disp_m = filtrar_cat(df_disp[df_disp["mes_key"] == mes_sel]) if not df_disp.empty else pd.DataFrame()
-df_os_m = df_os[df_os["mes_key"] == mes_sel].copy() if not df_os.empty else pd.DataFrame()
-df_os_m = filtrar_cat(df_os_m)
-df_pecas_m = filtrar_cat(df_pecas[df_pecas["mes_key"] == mes_sel]) if not df_pecas.empty else pd.DataFrame()
-df_lanc_m = filtrar_cat(df_lanc[df_lanc["mes_key"] == mes_sel]) if not df_lanc.empty else pd.DataFrame()
-df_abast_m = filtrar_cat(df_abast[df_abast["mes_key"] == mes_sel]) if not df_abast.empty else pd.DataFrame()
+df_disp_m, df_os_m, df_pecas_m, df_lanc_m, df_abast_m, df_abast_s500_m = prep_dados_escopo(
+    df_disp, df_os, df_pecas, df_lanc, df_abast, df_abast_det, meses_ativos,
+)
 
-# Calcular custos de parada do mês
+# Calcular custos de parada do escopo ativo
 df_parada = calc_parada_os(df_os_m, df_colab, df_apont) if not df_os_m.empty else pd.DataFrame()
 
-# KPIs do mês
+# KPIs do escopo (mês ou período)
 disp_media = df_disp_m["disponibilidade_pct"].mean() if not df_disp_m.empty else 0
 ht = df_disp_m["horas_trabalhadas"].sum() if not df_disp_m.empty else 0
 hp = df_disp_m["horas_parada"].sum() if not df_disp_m.empty else 0
@@ -1229,8 +1289,9 @@ custo_lanc = df_lanc_m["valor_total"].sum() if not df_lanc_m.empty else 0
 custo_parada_mec = df_parada["_c_mec"].sum() if not df_parada.empty else 0
 custo_parada_op = df_parada["_c_op"].sum() if not df_parada.empty else 0
 custo_parada_tot = df_parada["_c_tot"].sum() if not df_parada.empty else 0
-litros = df_abast_m["litros_total"].sum() if not df_abast_m.empty else 0
-df_abast_s500_m = abast_s500_mes(df_abast_det, mes_sel)
+litros = df_disp_m["litros_uso"].sum() if escopo_periodo and "litros_uso" in df_disp_m.columns else (
+    df_abast_m["litros_total"].sum() if not df_abast_m.empty else 0
+)
 df_extra_custos, df_lanc_rot, df_pecas_rot = separar_custos_outliers(df_lanc_m, df_pecas_m)
 custo_lanc_rot = (
     pd.to_numeric(
@@ -1241,8 +1302,11 @@ custo_lanc_rot = (
 )
 custo_pecas_rot = df_pecas_rot["custo_pecas"].sum() if not df_pecas_rot.empty else 0
 custo_extra = df_extra_custos["valor"].sum() if not df_extra_custos.empty else 0
-df_rank = montar_rank_tratores(df_disp_m, df_abast_m, df_abast_s500_m)
-df_linear = calc_operacao_linear(df_apont, df_os, mes_sel, df_painel)
+df_rank = montar_rank_tratores(df_disp_m, None if escopo_periodo else df_abast_m, df_abast_s500_m)
+if escopo_periodo:
+    df_linear = calc_operacao_linear_periodo(df_apont, df_os, meses_ativos, df_painel)
+else:
+    df_linear = calc_operacao_linear(df_apont, df_os, mes_sel, df_painel)
 if not df_linear.empty and not df_rank.empty:
     df_rank = df_rank.merge(
         df_linear[["id_frota", "dias_linear", "horas_linear", "periodo"]],
@@ -1251,7 +1315,9 @@ if not df_linear.empty and not df_rank.empty:
     df_rank["horas_linear"] = pd.to_numeric(df_rank["horas_linear"], errors="coerce").fillna(0)
     df_rank["dias_linear"] = pd.to_numeric(df_rank["dias_linear"], errors="coerce").fillna(0).astype(int)
 
-meses_tri = meses_do_periodo(periodo_sel, set(meses_opts))
+n_os_escopo = df_os_m["numero_os"].nunique() if not df_os_m.empty and "numero_os" in df_os_m.columns else len(df_os_m)
+
+# Variáveis da aba Mai–Jun–Jul (sempre o bloco completo)
 df_abast_s500_tri = abast_s500_periodo(df_abast_det, meses_tri)
 df_frota_tri = agg_frota_trimestre(df_disp, df_abast, df_abast_s500_tri, meses_tri)
 df_os_tri = (
@@ -1296,20 +1362,20 @@ tab1, tab_tri, tab2, tab3, tab4, tab5 = st.tabs([
 # TAB 1 — VISÃO EXECUTIVA
 # ══════════════════════════════════════════════════════════════
 with tab1:
-    st.markdown(f'<div class="sec">Indicadores estratégicos · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sec">Indicadores estratégicos · {titulo_periodo}</div>', unsafe_allow_html=True)
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("📊 Disponibilidade", f"{disp_media:.1f}%")
     k2.metric("⚙️ H. Operando", f"{fmt(ht)}h")
     k3.metric("🔴 H. Paradas", f"{fmt(hp)}h")
-    k4.metric("🔧 OS no Mês", len(df_os_m))
+    k4.metric("🔧 OS" + (" no período" if escopo_periodo else " no mês"), int(n_os_escopo))
     k5.metric("💸 Custo Parada", fmtR(custo_parada_tot))
     k6.metric("🔩 Peças (OS)", fmtR(custo_pecas))
 
     st.caption(
-        f"Base operacional desde {fmt_mes_label(MES_INICIO_COLETA)} — "
-        "somente tratores produtivos (colheitadeiras excluídas) · "
-        "horas lineares, consumo, MO mecânico."
+        f"Dados: {titulo_periodo}"
+        + (f" ({', '.join(fmt_mes_label(m) for m in meses_ativos)})" if escopo_periodo else "")
+        + " · tratores produtivos · colheitadeiras excluídas · atualizado em tempo real."
     )
 
     ce1, ce2 = st.columns([1, 1.2])
@@ -1319,7 +1385,7 @@ with tab1:
             st.plotly_chart(
                 gauge_disponibilidade(
                     disp_media,
-                    f"Disponibilidade · {fmt_mes_label(mes_sel)}",
+                    f"Disponibilidade · {titulo_periodo}",
                     df_disp_m["id_frota"].nunique() if not df_disp_m.empty else 0,
                     ht, hp,
                 ),
@@ -1329,7 +1395,7 @@ with tab1:
             st.info("Sem dados de disponibilidade para este mês.")
 
     with ce2:
-        st.markdown('<div class="sec">Top 5 · horas operando no mês</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sec">Top 5 · horas operando{" no período" if escopo_periodo else " no mês"}</div>', unsafe_allow_html=True)
         if not df_rank.empty:
             fig_top_op = chart_top5(
                 df_rank, "horas_trabalhadas", "",
@@ -1343,6 +1409,7 @@ with tab1:
     st.markdown('<div class="sec">Evolução operacional · meses com coleta</div>', unsafe_allow_html=True)
     if not df_resumo.empty:
         trend = filtrar_meses_coleta(df_resumo)
+        trend = trend[trend["mes_key"].astype(str).isin(meses_tri if escopo_periodo else meses_ativos)]
         trend = trend[trend["horas_trabalhadas"] > 0].sort_values("mes_key").tail(n_meses_trend)
         if trend.empty:
             st.info(f"Sem histórico operacional antes de {fmt_mes_label(MES_INICIO_COLETA)}.")
@@ -1378,7 +1445,7 @@ with tab1:
         st.info("Sem resumo mensal — rode as views SQL no Supabase.")
 
     if not df_rank.empty:
-        st.markdown(f'<div class="sec">Resumo Top 5 · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sec">Resumo Top 5 · {titulo_periodo}</div>', unsafe_allow_html=True)
         cols_rank = st.columns(4)
         for i, (titulo, col, fn) in enumerate([
             ("⚙️ Operando", "horas_trabalhadas", lambda v: f"{v:.0f}h"),
@@ -1537,7 +1604,7 @@ with tab_tri:
                 dark_table(lin_m_show, height=280)
             else:
                 st.info(
-                    f"Nenhum equipamento elegível em {fmt_mes_label(mes_sel)} "
+                    f"Nenhum equipamento elegível em {titulo_periodo} "
                     f"(mín. {MIN_DIAS_APONT_MES} dias apontados, {MIN_DIAS_SEQ_LINEAR}d seguidos sem OS)."
                 )
 
@@ -1604,7 +1671,7 @@ with tab2:
     if df_disp_m.empty:
         st.warning("Sem dados de disponibilidade para o mês/categorias selecionados.")
     else:
-        st.markdown(f'<div class="sec">Parado × Operando · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="sec">Parado × Operando · {titulo_periodo}</div>', unsafe_allow_html=True)
         df_disp_m = df_disp_m.copy()
         df_disp_m["label"] = df_disp_m.apply(label_trator, axis=1)
 
@@ -1656,7 +1723,7 @@ with tab2:
             st.markdown('<div class="sec">Heatmap · Disponibilidade % (frota × mês)</div>', unsafe_allow_html=True)
             st.caption(f"Apenas meses com coleta desde {fmt_mes_label(MES_INICIO_COLETA)}")
             df_hm = filtrar_cat(filtrar_meses_coleta(df_disp.copy()))
-            meses_hm = [m for m in meses_com_coleta(df_apont, df_disp) if m >= MES_INICIO_COLETA][-n_meses_trend:]
+            meses_hm = meses_tri if escopo_periodo else meses_ativos
             df_hm = df_hm[df_hm["mes_key"].astype(str).isin(meses_hm)]
             if not df_hm.empty:
                 pivot = df_hm.pivot_table(
@@ -1690,7 +1757,7 @@ with tab2:
 # TAB 3 — CUSTOS & PEÇAS
 # ══════════════════════════════════════════════════════════════
 with tab3:
-    st.markdown(f'<div class="sec">Custos de manutenção · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sec">Custos de manutenção · {titulo_periodo}</div>', unsafe_allow_html=True)
     st.caption(
         f"Gráficos rotineiros excluem eventos ≥ {fmtR(LIMITE_OUTLIER_CUSTO)} "
         "(ex.: revisão de motor). Eventos extraordinários aparecem na tabela abaixo."
@@ -1773,7 +1840,7 @@ with tab3:
 # TAB 4 — RANKING TRATORES
 # ══════════════════════════════════════════════════════════════
 with tab4:
-    st.markdown(f'<div class="sec">Ranking operacional · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sec">Ranking operacional · {titulo_periodo}</div>', unsafe_allow_html=True)
     st.caption(
         "Fonte operacional: apontamento_campo. Operação linear exige "
         f"≥{MIN_DIAS_APONT_MES} dias apontados/mês, ≥{MIN_DIAS_SEQ_LINEAR} dias seguidos sem OS — "
@@ -1827,7 +1894,7 @@ with tab4:
                     st.plotly_chart(fig_r4, use_container_width=True, key="k_rank_lin")
             else:
                 st.info(
-                    f"Nenhum equipamento elegível em {fmt_mes_label(mes_sel)} "
+                    f"Nenhum equipamento elegível em {titulo_periodo} "
                     "(harvester/colheitadeira ou poucos dias apontados)."
                 )
 
@@ -1850,27 +1917,15 @@ with tab4:
 # TAB 5 — ABASTECIMENTO × PRODUTIVIDADE
 # ══════════════════════════════════════════════════════════════
 with tab5:
-    st.markdown(f'<div class="sec">Combustível vs horas operando · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sec">Combustível vs horas operando · {titulo_periodo}</div>', unsafe_allow_html=True)
 
     ab1, ab2, ab3 = st.columns(3)
     ab1.metric("⛽ Litros abastecidos", f"{fmt(litros)} L")
     ab2.metric("⚙️ Horas operando", f"{fmt(ht)}h")
     ab3.metric("📈 L/h produtividade", f"{litros/ht:.1f} L/h" if ht > 0 else "—")
 
-    if not df_abast_m.empty and not df_disp_m.empty:
-        cruz = df_abast_m.merge(
-            df_disp_m[["id_frota", "horas_trabalhadas", "horas_parada", "disponibilidade_pct"]],
-            on="id_frota", how="inner",
-        )
-        cruz["litros_h"] = cruz.apply(
-            lambda r: r["litros_total"] / r["horas_trabalhadas"] if r["horas_trabalhadas"] > 0 else 0,
-            axis=1,
-        )
-        cruz["label"] = cruz.apply(
-            lambda r: label_trator({"id_frota": r["id_frota"], "modelo": r.get("modelo", "")}),
-            axis=1,
-        )
-
+    cruz = cruzamento_combustivel(df_disp_m, df_abast_m)
+    if not cruz.empty:
         ax1, ax2 = st.columns(2)
         with ax1:
             st.markdown('<div class="sec">Scatter · Litros × Horas operando</div>', unsafe_allow_html=True)
