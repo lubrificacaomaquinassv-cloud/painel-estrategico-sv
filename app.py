@@ -5,7 +5,9 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import unicodedata
 
-PAINEL_BUILD = "2026-07-24-apontamento-campo-v2"
+PAINEL_BUILD = "2026-07-24-ranking-tratores-v5"
+MES_INICIO_COLETA = "2026-05"  # início apontamento_campo
+LIMITE_OUTLIER_CUSTO = 50000.0  # ex.: motor R$ 91k — fora dos gráficos rotineiros
 
 st.set_page_config(
     page_title="Painel Estratégico — Mecanização SV",
@@ -136,6 +138,127 @@ def fmt_mes_label(mes_key):
         return str(mes_key)
 
 
+def meses_com_coleta(df_apont, df_disp=None):
+    """Somente meses com apontamento real (>= maio/2026)."""
+    meses = set()
+    if df_apont is not None and not df_apont.empty:
+        ap = df_apont.copy()
+        ap["_mk"] = pd.to_datetime(ap["data"], errors="coerce").dt.strftime("%Y-%m")
+        for mk, g in ap.groupby("_mk"):
+            if mk and mk >= MES_INICIO_COLETA and g["horas_trabalhadas"].sum() > 0:
+                meses.add(mk)
+    if df_disp is not None and not df_disp.empty and "mes_key" in df_disp.columns:
+        g = df_disp.groupby("mes_key")["horas_trabalhadas"].sum()
+        for mk, h in g.items():
+            if str(mk) >= MES_INICIO_COLETA and h > 0:
+                meses.add(str(mk))
+    return sorted(meses)
+
+
+def filtrar_meses_coleta(df, col="mes_key"):
+    if df.empty or col not in df.columns:
+        return df
+    return df[df[col].astype(str) >= MES_INICIO_COLETA].copy()
+
+
+def maior_sequencia_dias(datas):
+    """Maior sequência de dias consecutivos."""
+    if not datas:
+        return []
+    datas = sorted(set(datas))
+    best, cur = [datas[0]], [datas[0]]
+    for d in datas[1:]:
+        if (d - cur[-1]).days == 1:
+            cur.append(d)
+        else:
+            if len(cur) > len(best):
+                best = cur
+            cur = [d]
+    if len(cur) > len(best):
+        best = cur
+    return best
+
+
+def calc_operacao_linear(df_apont, df_os, mes_sel):
+    """Maior período do mês com apontamento e sem OS — horas lineares."""
+    if df_apont.empty:
+        return pd.DataFrame()
+    ap = df_apont.copy()
+    ap["_mk"] = pd.to_datetime(ap["data"], errors="coerce").dt.strftime("%Y-%m")
+    ap = ap[(ap["_mk"] == mes_sel) & (ap["horas_trabalhadas"] > 0)]
+    if ap.empty:
+        return pd.DataFrame()
+
+    os_por_frota = {}
+    if not df_os.empty:
+        os = df_os[df_os["mes_key"].astype(str) == mes_sel].copy()
+        if "data_os" not in os.columns and "created_at" in os.columns:
+            os["data_os"] = parse_dt(os["created_at"]).dt.date
+        for fid, g in os.groupby(os["id_frota"].astype(str)):
+            os_por_frota[fid] = set(g["data_os"].dropna())
+
+    rows = []
+    for frota, grp in ap.groupby("frota"):
+        por_dia = grp.groupby("data")["horas_trabalhadas"].sum()
+        os_dias = os_por_frota.get(str(frota), set())
+        dias_limpos = sorted(d for d in por_dia.index if d not in os_dias)
+        seq = maior_sequencia_dias(dias_limpos)
+        rows.append({
+            "id_frota": str(frota),
+            "dias_linear": len(seq),
+            "horas_linear": sum(por_dia[d] for d in seq) if seq else 0,
+            "periodo": f"{seq[0].strftime('%d/%m')}–{seq[-1].strftime('%d/%m')}" if seq else "—",
+        })
+    return pd.DataFrame(rows).sort_values("horas_linear", ascending=False)
+
+
+def montar_rank_tratores(df_disp_m, df_abast_m=None, df_abast_s500=None):
+    if df_disp_m.empty:
+        return pd.DataFrame()
+    r = df_disp_m.copy()
+    r["label"] = r.apply(label_trator, axis=1)
+    if df_abast_m is not None and not df_abast_m.empty:
+        r = r.merge(
+            df_abast_m[["id_frota", "litros_total"]].rename(columns={"litros_total": "litros"}),
+            on="id_frota", how="left",
+        )
+    else:
+        r["litros"] = 0.0
+    if df_abast_s500 is not None and not df_abast_s500.empty:
+        r = r.merge(
+            df_abast_s500[["id_frota", "litros_s500"]], on="id_frota", how="left",
+        )
+    else:
+        r["litros_s500"] = 0.0
+    r["litros"] = pd.to_numeric(r.get("litros", 0), errors="coerce").fillna(0)
+    r["litros_s500"] = pd.to_numeric(r.get("litros_s500", 0), errors="coerce").fillna(0)
+    if r["litros"].sum() == 0 and r["litros_s500"].sum() > 0:
+        r["litros"] = r["litros_s500"]
+    r["litros_h"] = r.apply(
+        lambda x: x["litros"] / x["horas_trabalhadas"] if x["horas_trabalhadas"] > 0 else 0,
+        axis=1,
+    )
+    return r
+
+
+def chart_top5(df, col, titulo, cor, fmt_fn=None, orientation="h"):
+    if df.empty or col not in df.columns:
+        st.info("Sem dados para este ranking.")
+        return
+    top = df.nlargest(5, col).sort_values(col, ascending=True)
+    txt = top[col].apply(fmt_fn) if fmt_fn else top[col].astype(str)
+    fig = go.Figure(go.Bar(
+        y=top["label"], x=top[col], orientation=orientation,
+        marker_color=cor,
+        text=txt, textposition="outside",
+        textfont=dict(color="#e8edd0", size=11),
+        hovertemplate="%{y}<br>%{x:.1f}<extra></extra>",
+    ))
+    fig.update_layout(**PDARK, height=280, title=dict(text=titulo, font=dict(size=13, color="#8aab80")),
+                      xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS})
+    return fig
+
+
 def meses_disponiveis(series, mes_atual_str, n=12):
     meses = sorted(
         {str(m) for m in series.dropna().unique() if str(m) not in ("", "NaT", "None")},
@@ -158,32 +281,117 @@ def label_trator(row):
 
 import psycopg2
 
-DB_HOST = st.secrets["db"]["host"]
+
+def _secret(key, default=None):
+    try:
+        return st.secrets[key]
+    except (KeyError, TypeError):
+        return default
+
+
+def _db_cfg():
+    db = _secret("db")
+    if not db or not db.get("host"):
+        return None
+    return db
+
+
+def _supabase_cfg():
+    url = _secret("SUPABASE_URL")
+    key = _secret("SUPABASE_KEY")
+    if url and key:
+        return url, key
+    return None, None
+
+
+def _setup_secrets():
+    st.error("Secrets não configurados no Streamlit Cloud.")
+    st.markdown(
+        "**Settings → Secrets** — cole o bloco abaixo "
+        "(mesma senha do Postgres usada nos outros painéis SV):"
+    )
+    st.code(
+        """SUPABASE_URL = "https://azhpxhrwhegfysoeqmft.supabase.co"
+SUPABASE_KEY = "sua_anon_key_aqui"
+
+[db]
+host = "aws-1-sa-east-1.pooler.supabase.com"
+port = 6543
+dbname = "postgres"
+user = "postgres.azhpxhrwhegfysoeqmft"
+password = "SUA_SENHA_DO_BANCO"
+""",
+        language="toml",
+    )
+    st.info(
+        "O painel usa Postgres direto (`[db]`) ou Supabase REST (`SUPABASE_URL` + `SUPABASE_KEY`). "
+        "Depois de salvar, clique **Reboot app** no menu do Streamlit Cloud."
+    )
+    st.stop()
+
+
+_db = _db_cfg()
+_sb_url, _sb_key = _supabase_cfg()
+if _db:
+    CACHE_KEY = str(_db["host"])
+    DATA_MODE = "postgres"
+elif _sb_url:
+    from supabase import create_client
+    _supabase = create_client(_sb_url, _sb_key)
+    CACHE_KEY = _sb_url
+    DATA_MODE = "supabase"
+else:
+    _setup_secrets()
 
 
 def get_conn():
+    db = _db_cfg()
+    if not db:
+        raise RuntimeError("Postgres indisponível neste modo")
     return psycopg2.connect(
-        host=st.secrets["db"]["host"],
-        port=st.secrets["db"]["port"],
-        dbname=st.secrets["db"]["dbname"],
-        user=st.secrets["db"]["user"],
-        password=st.secrets["db"]["password"],
+        host=db["host"],
+        port=db["port"],
+        dbname=db["dbname"],
+        user=db["user"],
+        password=db["password"],
         sslmode="require",
     )
 
 
 def sb(table, order_col=None, desc=True):
-    conn = get_conn()
-    try:
-        q = f"SELECT * FROM {table}"
-        if order_col:
-            direction = "DESC" if desc else "ASC"
-            q += f' ORDER BY "{order_col}" {direction}'
-        return pd.read_sql_query(q, conn)
-    except Exception:
-        return pd.DataFrame()
-    finally:
-        conn.close()
+    if DATA_MODE == "postgres":
+        conn = get_conn()
+        try:
+            q = f"SELECT * FROM {table}"
+            if order_col:
+                direction = "DESC" if desc else "ASC"
+                q += f' ORDER BY "{order_col}" {direction}'
+            return pd.read_sql_query(q, conn)
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            conn.close()
+
+    all_data = []
+    page_size = 1000
+    offset = 0
+    while True:
+        try:
+            q = _supabase.table(table).select("*")
+            if order_col:
+                q = q.order(order_col, desc=desc)
+            r = q.range(offset, offset + page_size - 1).execute()
+        except Exception:
+            try:
+                r = _supabase.table(table).select("*").range(offset, offset + page_size - 1).execute()
+            except Exception:
+                return pd.DataFrame()
+        batch = r.data or []
+        all_data.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return pd.DataFrame(all_data)
 
 
 def calc_disp_from_apontamento(df_apont, df_os, df_painel=None):
@@ -355,6 +563,38 @@ def load_abast(_c):
     return df
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def load_abast_detalhe(_c):
+    df = sb("vw_painel_abastecimento", order_col="created_at", desc=True)
+    if df.empty:
+        df = sb("vw_abastecimento_consolidado", order_col="created_at", desc=True)
+    if df.empty:
+        return df
+    df = df.copy()
+    df["mes_key"] = parse_mes_key(parse_dt(df["created_at"]))
+    df["id_frota"] = norm_frota_id(df.get("vehicle", df.get("id_frota", "")))
+    df["liters"] = pd.to_numeric(df.get("liters", 0), errors="coerce").fillna(0)
+    if "fuel_type" in df.columns:
+        df["fuel_type"] = df["fuel_type"].astype(str).str.upper()
+    return df
+
+
+def abast_s500_mes(df_det, mes_sel):
+    if df_det.empty:
+        return pd.DataFrame(columns=["id_frota", "litros_s500"])
+    d = filtrar_meses_coleta(df_det)
+    d = d[d["mes_key"].astype(str) == mes_sel].copy()
+    if "fuel_type" in d.columns:
+        d = d[d["fuel_type"].str.contains(r"S.?500|ADITIVADO", na=False, regex=True)]
+    if d.empty:
+        return pd.DataFrame(columns=["id_frota", "litros_s500"])
+    return (
+        d.groupby("id_frota", as_index=False)["liters"]
+        .sum()
+        .rename(columns={"liters": "litros_s500"})
+    )
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_colab(_c):
     df = sb("vw_painel_estrategico_colaboradores")
@@ -459,6 +699,45 @@ def calc_parada_os(df_os, df_colab, df_apont):
     return out
 
 
+def separar_custos_outliers(df_lanc_m, df_pecas_m, limite=LIMITE_OUTLIER_CUSTO):
+    """Separa lançamentos/OS extraordinários (ex.: motor R$ 91k) dos rotineiros."""
+    extra_rows = []
+    lanc_rot = df_lanc_m.copy() if not df_lanc_m.empty else pd.DataFrame()
+    pecas_rot = df_pecas_m.copy() if not df_pecas_m.empty else pd.DataFrame()
+
+    if not df_lanc_m.empty:
+        vcol = "valor_total" if "valor_total" in df_lanc_m.columns else "valor"
+        df_l = df_lanc_m.copy()
+        df_l["_v"] = pd.to_numeric(df_l.get(vcol, 0), errors="coerce").fillna(0)
+        mask = df_l["_v"] >= limite
+        if mask.any():
+            for _, r in df_l[mask].iterrows():
+                extra_rows.append({
+                    "tipo": "NF-e / Lançamento",
+                    "referencia": str(r.get("descricao", r.get("fornecedor", r.get("id", "—"))))[:60],
+                    "frota": str(r.get("id_frota", "—")),
+                    "valor": r["_v"],
+                })
+            lanc_rot = df_l[~mask].drop(columns=["_v"], errors="ignore")
+
+    if not df_pecas_m.empty:
+        df_p = df_pecas_m.copy()
+        df_p["_v"] = pd.to_numeric(df_p.get("custo_pecas", 0), errors="coerce").fillna(0)
+        df_p["_tot"] = df_p["_v"] + pd.to_numeric(df_p.get("custo_mo", 0), errors="coerce").fillna(0)
+        mask = df_p["_tot"] >= limite
+        if mask.any():
+            for _, r in df_p[mask].iterrows():
+                extra_rows.append({
+                    "tipo": "OS / Peças",
+                    "referencia": f"OS {r.get('numero_os', '—')}",
+                    "frota": str(r.get("id_frota", "—")),
+                    "valor": r["_tot"],
+                })
+            pecas_rot = df_p[~mask].drop(columns=["_v", "_tot"], errors="ignore")
+
+    return pd.DataFrame(extra_rows), lanc_rot, pecas_rot
+
+
 def gauge_disponibilidade(valor, titulo, nf, ht, hp):
     cor = "#c0392b" if valor < 70 else "#d4a017" if valor < 85 else "#4a9e3f"
     fig = go.Figure(go.Indicator(
@@ -521,26 +800,29 @@ st.divider()
 hoje = (datetime.utcnow() - timedelta(hours=3)).date()
 mes_atual_str = pd.Period(hoje, freq="M").strftime("%Y-%m")
 
-df_resumo = load_resumo_mes(DB_HOST)
-df_disp = load_disp_mes(DB_HOST)
-df_os = load_os(DB_HOST)
-df_pecas = load_pecas(DB_HOST)
-df_lanc = load_lancamentos(DB_HOST)
-df_abast = load_abast(DB_HOST)
-df_colab = load_colab(DB_HOST)
-df_apont = load_apont(DB_HOST)
-df_painel = load_frota_painel(DB_HOST)
+df_resumo = load_resumo_mes(CACHE_KEY)
+df_disp = load_disp_mes(CACHE_KEY)
+df_os = load_os(CACHE_KEY)
+df_pecas = load_pecas(CACHE_KEY)
+df_lanc = load_lancamentos(CACHE_KEY)
+df_abast = load_abast(CACHE_KEY)
+df_abast_det = load_abast_detalhe(CACHE_KEY)
+df_colab = load_colab(CACHE_KEY)
+df_apont = load_apont(CACHE_KEY)
+df_painel = load_frota_painel(CACHE_KEY)
 
 # ── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### Filtros")
-    meses_opts = meses_disponiveis(
-        df_resumo["mes_key"] if not df_resumo.empty else pd.Series([mes_atual_str]),
-        mes_atual_str,
-        n=12,
-    )
+    meses_coleta = meses_com_coleta(df_apont, df_disp)
+    meses_opts = [m for m in meses_coleta if m >= MES_INICIO_COLETA]
     if not meses_opts:
-        meses_opts = [mes_atual_str]
+        meses_opts = meses_disponiveis(
+            df_disp["mes_key"] if not df_disp.empty else pd.Series([mes_atual_str]),
+            mes_atual_str,
+            n=6,
+        )
+        meses_opts = [m for m in meses_opts if m >= MES_INICIO_COLETA] or [mes_atual_str]
     mes_sel = st.selectbox(
         "Mês de referência",
         options=meses_opts,
@@ -560,7 +842,10 @@ with st.sidebar:
         default=[c for c in categorias if c in ("EQUIPAMENTO", "MAQUINA", "OUTRO")][:3] or categorias[:2],
         key="cat_sel",
     )
-    st.caption("Horas operando: apontamento_campo · Parada: ordem_servico")
+    st.caption(
+        f"Coleta desde {fmt_mes_label(MES_INICIO_COLETA)} · "
+        f"Fonte: {DATA_MODE} · apontamento_campo + ordem_servico"
+    )
 
 # Filtrar por categoria
 def filtrar_cat(df, col="categoria_painel"):
@@ -589,12 +874,32 @@ custo_parada_mec = df_parada["_c_mec"].sum() if not df_parada.empty else 0
 custo_parada_op = df_parada["_c_op"].sum() if not df_parada.empty else 0
 custo_parada_tot = df_parada["_c_tot"].sum() if not df_parada.empty else 0
 litros = df_abast_m["litros_total"].sum() if not df_abast_m.empty else 0
+df_abast_s500_m = abast_s500_mes(df_abast_det, mes_sel)
+df_extra_custos, df_lanc_rot, df_pecas_rot = separar_custos_outliers(df_lanc_m, df_pecas_m)
+custo_lanc_rot = (
+    pd.to_numeric(
+        df_lanc_rot.get("valor_total", df_lanc_rot.get("valor", 0)),
+        errors="coerce",
+    ).fillna(0).sum()
+    if not df_lanc_rot.empty else 0
+)
+custo_pecas_rot = df_pecas_rot["custo_pecas"].sum() if not df_pecas_rot.empty else 0
+custo_extra = df_extra_custos["valor"].sum() if not df_extra_custos.empty else 0
+df_rank = montar_rank_tratores(df_disp_m, df_abast_m, df_abast_s500_m)
+df_linear = calc_operacao_linear(df_apont, df_os, mes_sel)
+if not df_linear.empty and not df_rank.empty:
+    df_rank = df_rank.merge(
+        df_linear[["id_frota", "dias_linear", "horas_linear", "periodo"]],
+        on="id_frota", how="left",
+    )
+    df_rank["horas_linear"] = pd.to_numeric(df_rank["horas_linear"], errors="coerce").fillna(0)
+    df_rank["dias_linear"] = pd.to_numeric(df_rank["dias_linear"], errors="coerce").fillna(0).astype(int)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🎯 Visão Executiva",
     "⚙️ Horas & Disponibilidade",
     "💸 Custos & Peças",
-    "👷 Por Pessoa",
+    "🏆 Ranking Tratores",
     "⛽ Abastecimento × Produtividade",
 ])
 
@@ -611,6 +916,11 @@ with tab1:
     k4.metric("🔧 OS no Mês", len(df_os_m))
     k5.metric("💸 Custo Parada", fmtR(custo_parada_tot))
     k6.metric("🔩 Peças (OS)", fmtR(custo_pecas))
+
+    st.caption(
+        f"Base operacional desde {fmt_mes_label(MES_INICIO_COLETA)} — "
+        "custos extraordinários (ex.: motor) ficam na aba Financeiro, fora desta visão."
+    )
 
     ce1, ce2 = st.columns([1, 1.2])
 
@@ -629,85 +939,67 @@ with tab1:
             st.info("Sem dados de disponibilidade para este mês.")
 
     with ce2:
-        st.markdown('<div class="sec">Composição de custos · Waterfall</div>', unsafe_allow_html=True)
-        wf_vals = [
-            custo_pecas, custo_mo, custo_parada_mec, custo_parada_op, custo_lanc,
-        ]
-        wf_labels = ["Peças OS", "MO OS", "Parada Mec.", "Parada Oper.", "NF-e Lanç."]
-        wf_measures = ["relative"] * 5 + ["total"]
-        wf_x = wf_labels + ["Total"]
-        wf_y = wf_vals + [sum(wf_vals)]
-        fig_wf = go.Figure(go.Waterfall(
-            name="Custos",
-            orientation="v",
-            x=wf_x, y=wf_y,
-            measure=wf_measures,
-            connector={"line": {"color": "#1e2e1c"}},
-            increasing={"marker": {"color": "#4a9e3f"}},
-            decreasing={"marker": {"color": "#c0392b"}},
-            totals={"marker": {"color": "#2980b9"}},
-            text=[fmtR(v) for v in wf_y],
-            textposition="outside",
-            textfont=dict(color="#e8edd0", size=11),
-        ))
-        fig_wf.update_layout(**PDARK, height=280, showlegend=False, yaxis={**PLOT_AXIS, "title": "R$"})
-        st.plotly_chart(fig_wf, use_container_width=True, key="k_waterfall")
-
-    st.markdown('<div class="sec">Tendência · últimos meses</div>', unsafe_allow_html=True)
-    if not df_resumo.empty:
-        trend = df_resumo.sort_values("mes_key").tail(n_meses_trend).copy()
-        trend["mes_label"] = trend["mes_key"].map(fmt_mes_label)
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Scatter(
-            x=trend["mes_label"], y=trend["disp_media_pct"],
-            name="Disponib. %", mode="lines+markers",
-            line=dict(color="#4a9e3f", width=3), marker=dict(size=8),
-            yaxis="y",
-        ))
-        fig_trend.add_trace(go.Scatter(
-            x=trend["mes_label"], y=trend["horas_parada"],
-            name="H. Paradas", mode="lines+markers",
-            line=dict(color="#c0392b", width=2, dash="dot"), marker=dict(size=6),
-            yaxis="y2",
-        ))
-        fig_trend.add_trace(go.Bar(
-            x=trend["mes_label"], y=trend["custo_pecas"] + trend["custo_lancamentos"],
-            name="Custos R$", marker_color="rgba(41,128,185,0.5)",
-            yaxis="y3",
-        ))
-        fig_trend.update_layout(
-            **PDARK, height=320,
-            xaxis={**PLOT_AXIS},
-            yaxis={**PLOT_AXIS, "title": "Disponib. %", "side": "left", "range": [0, 100]},
-            yaxis2={**PLOT_AXIS, "title": "Horas paradas", "overlaying": "y", "side": "right"},
-            yaxis3={**PLOT_AXIS, "title": "R$ custos", "overlaying": "y", "anchor": "free", "position": 0.95, "showgrid": False},
-            legend=dict(orientation="h", y=1.12, font=dict(color="#e8edd0")),
-        )
-        st.plotly_chart(fig_trend, use_container_width=True, key="k_trend")
-    else:
-        st.info("Rode as views SQL (vw_painel_estrategico_resumo_mes) no Supabase para ver a tendência.")
-
-    if not df_pecas_m.empty or not df_lanc_m.empty:
-        st.markdown('<div class="sec">Distribuição de custos · Sunburst</div>', unsafe_allow_html=True)
-        sb_rows = []
-        if not df_pecas_m.empty:
-            for cat, r in df_pecas_m.groupby("categoria_painel")["custo_pecas"].sum().items():
-                sb_rows.append({"cat": str(cat), "tipo": "Peças OS", "valor": r})
-        if not df_lanc_m.empty:
-            for tipo, r in df_lanc_m.groupby("tipo_manutencao")["valor_total"].sum().items():
-                sb_rows.append({"cat": "Lançamentos", "tipo": str(tipo), "valor": r})
-        if custo_parada_tot > 0:
-            sb_rows.append({"cat": "Parada", "tipo": "Mecânico", "valor": custo_parada_mec})
-            sb_rows.append({"cat": "Parada", "tipo": "Operador", "valor": custo_parada_op})
-        if sb_rows:
-            df_sb = pd.DataFrame(sb_rows)
-            fig_sb = px.sunburst(
-                df_sb, path=["cat", "tipo"], values="valor",
-                color="cat", color_discrete_sequence=CORES,
+        st.markdown('<div class="sec">Top 5 · horas operando no mês</div>', unsafe_allow_html=True)
+        if not df_rank.empty:
+            fig_top_op = chart_top5(
+                df_rank, "horas_trabalhadas", "",
+                "#4a9e3f", lambda v: f"{v:.0f}h",
             )
-            fig_sb.update_layout(**PDARK, height=340)
-            fig_sb.update_traces(textinfo="label+percent entry", insidetextorientation="radial")
-            st.plotly_chart(fig_sb, use_container_width=True, key="k_sunburst")
+            if fig_top_op:
+                st.plotly_chart(fig_top_op, use_container_width=True, key="k_top5_op")
+        else:
+            st.info("Sem ranking — verifique apontamento_campo no mês.")
+
+    st.markdown('<div class="sec">Evolução operacional · meses com coleta</div>', unsafe_allow_html=True)
+    if not df_resumo.empty:
+        trend = filtrar_meses_coleta(df_resumo)
+        trend = trend[trend["horas_trabalhadas"] > 0].sort_values("mes_key").tail(n_meses_trend)
+        if trend.empty:
+            st.info(f"Sem histórico operacional antes de {fmt_mes_label(MES_INICIO_COLETA)}.")
+        else:
+            trend["mes_label"] = trend["mes_key"].map(fmt_mes_label)
+            fig_trend = go.Figure()
+            fig_trend.add_trace(go.Scatter(
+                x=trend["mes_label"], y=trend["disp_media_pct"],
+                name="Disponib. %", mode="lines+markers",
+                line=dict(color="#4a9e3f", width=3), marker=dict(size=8),
+            ))
+            fig_trend.add_trace(go.Scatter(
+                x=trend["mes_label"], y=trend["horas_trabalhadas"],
+                name="H. operando", mode="lines+markers",
+                line=dict(color="#2980b9", width=2), marker=dict(size=7),
+                yaxis="y2",
+            ))
+            fig_trend.add_trace(go.Scatter(
+                x=trend["mes_label"], y=trend["horas_parada"],
+                name="H. parada (OS)", mode="lines+markers",
+                line=dict(color="#c0392b", width=2, dash="dot"), marker=dict(size=6),
+                yaxis="y2",
+            ))
+            fig_trend.update_layout(
+                **PDARK, height=320,
+                xaxis={**PLOT_AXIS},
+                yaxis={**PLOT_AXIS, "title": "Disponib. %", "range": [0, 100]},
+                yaxis2={**PLOT_AXIS, "title": "Horas", "overlaying": "y", "side": "right"},
+                legend=dict(orientation="h", y=1.12, font=dict(color="#e8edd0")),
+            )
+            st.plotly_chart(fig_trend, use_container_width=True, key="k_trend")
+    else:
+        st.info("Sem resumo mensal — rode as views SQL no Supabase.")
+
+    if not df_rank.empty:
+        st.markdown(f'<div class="sec">Resumo Top 5 · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+        cols_rank = st.columns(4)
+        for i, (titulo, col, fn) in enumerate([
+            ("⚙️ Operando", "horas_trabalhadas", lambda v: f"{v:.0f}h"),
+            ("🔴 Paradas", "horas_parada", lambda v: f"{v:.0f}h"),
+            ("⛽ Litros", "litros", lambda v: f"{v:,.0f} L"),
+            ("📈 L/h", "litros_h", lambda v: f"{v:.1f}"),
+        ]):
+            top1 = df_rank.nlargest(1, col)
+            with cols_rank[i]:
+                if not top1.empty:
+                    st.metric(titulo, fn(top1.iloc[0][col]), top1.iloc[0]["label"][:28])
 
 # ══════════════════════════════════════════════════════════════
 # TAB 2 — HORAS & DISPONIBILIDADE
@@ -766,27 +1058,34 @@ with tab2:
         # Heatmap frota x mes
         if not df_disp.empty:
             st.markdown('<div class="sec">Heatmap · Disponibilidade % (frota × mês)</div>', unsafe_allow_html=True)
-            df_hm = filtrar_cat(df_disp.copy())
-            meses_hm = sorted(df_hm["mes_key"].unique())[-n_meses_trend:]
-            df_hm = df_hm[df_hm["mes_key"].isin(meses_hm)]
+            st.caption(f"Apenas meses com coleta desde {fmt_mes_label(MES_INICIO_COLETA)}")
+            df_hm = filtrar_cat(filtrar_meses_coleta(df_disp.copy()))
+            meses_hm = [m for m in meses_com_coleta(df_apont, df_disp) if m >= MES_INICIO_COLETA][-n_meses_trend:]
+            df_hm = df_hm[df_hm["mes_key"].astype(str).isin(meses_hm)]
             if not df_hm.empty:
                 pivot = df_hm.pivot_table(
-                    index="id_frota", columns="mes_key", values="disponibilidade_pct", aggfunc="mean"
+                    index="id_frota", columns="mes_key", values="disponibilidade_pct", aggfunc="mean",
                 )
-                pivot = pivot.loc[pivot.mean(axis=1).sort_values().index]
+                # Top 12 frotas por horas no período (legível na reunião)
+                horas_idx = df_hm.groupby("id_frota")["horas_trabalhadas"].sum()
+                top_f = horas_idx.nlargest(12).index
+                pivot = pivot.reindex(top_f).dropna(how="all")
+                pivot = pivot.reindex(columns=sorted(pivot.columns))
+                z = pivot.values.astype(float)
+                txt = [[f"{v:.0f}%" if pd.notna(v) else "" for v in row] for row in z]
                 fig_hm = go.Figure(go.Heatmap(
-                    z=pivot.values,
+                    z=z,
                     x=[fmt_mes_label(c) for c in pivot.columns],
-                    y=pivot.index.astype(str),
+                    y=[label_trator({"id_frota": f, "modelo": df_hm.loc[df_hm["id_frota"] == f, "modelo"].iloc[0] if f in df_hm["id_frota"].values and "modelo" in df_hm.columns else ""}) for f in pivot.index],
                     colorscale=[[0, "#2a1010"], [0.7, "#2a2200"], [0.85, "#1a3318"], [1, "#4a9e3f"]],
                     zmin=0, zmax=100,
-                    text=pivot.values.round(1),
-                    texttemplate="%{text}%",
-                    textfont=dict(size=10, color="#e8edd0"),
-                    hovertemplate="Frota %{y}<br>%{x}: %{z:.1f}%<extra></extra>",
+                    text=txt,
+                    texttemplate="%{text}",
+                    textfont=dict(size=11, color="#e8edd0"),
+                    hovertemplate="%{y}<br>%{x}: %{z:.1f}%<extra></extra>",
                 ))
                 fig_hm.update_layout(
-                    **PDARK, height=max(280, len(pivot) * 22),
+                    **PDARK, height=max(300, len(pivot) * 26),
                     xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS, "tickfont": dict(size=10)},
                 )
                 st.plotly_chart(fig_hm, use_container_width=True, key="k_heatmap")
@@ -796,24 +1095,38 @@ with tab2:
 # ══════════════════════════════════════════════════════════════
 with tab3:
     st.markdown(f'<div class="sec">Custos de manutenção · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.caption(
+        f"Gráficos rotineiros excluem eventos ≥ {fmtR(LIMITE_OUTLIER_CUSTO)} "
+        "(ex.: revisão de motor). Eventos extraordinários aparecem na tabela abaixo."
+    )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("🔩 Peças (financeiro_os)", fmtR(custo_pecas))
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("🔩 Peças rotineiras", fmtR(custo_pecas_rot))
     c2.metric("🔧 MO registrada", fmtR(custo_mo))
-    c3.metric("📄 NF-e (lançamentos)", fmtR(custo_lanc))
-    c4.metric("⏱ Custo parada total", fmtR(custo_parada_tot))
-    c5.metric("💰 Total estimado", fmtR(custo_pecas + custo_mo + custo_lanc + custo_parada_tot))
+    c3.metric("📄 NF-e rotineiras", fmtR(custo_lanc_rot))
+    c4.metric("⏱ Custo parada", fmtR(custo_parada_tot))
+    c5.metric("⚠️ Extraordinários", fmtR(custo_extra))
+    c6.metric("💰 Total mês", fmtR(custo_pecas + custo_mo + custo_lanc + custo_parada_tot))
+
+    if not df_extra_custos.empty:
+        st.markdown('<div class="sec">Eventos extraordinários do mês</div>', unsafe_allow_html=True)
+        extra_show = df_extra_custos.sort_values("valor", ascending=False).copy()
+        extra_show["Valor"] = extra_show["valor"].apply(fmtR)
+        dark_table(extra_show[["tipo", "referencia", "frota", "Valor"]].rename(columns={
+            "tipo": "Tipo", "referencia": "Referência", "frota": "Frota",
+        }), height=160)
 
     ct1, ct2 = st.columns(2)
     with ct1:
-        st.markdown('<div class="sec">Top frotas · Treemap de custos</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec">Top frotas · custos rotineiros</div>', unsafe_allow_html=True)
         tm_rows = []
-        if not df_pecas_m.empty:
-            for fid, v in df_pecas_m.groupby("id_frota")["custo_pecas"].sum().items():
-                tm_rows.append({"frota": str(fid), "tipo": "Peças", "valor": v})
+        if not df_pecas_rot.empty:
+            for fid, v in df_pecas_rot.groupby("id_frota")["custo_pecas"].sum().items():
+                if v > 0:
+                    tm_rows.append({"frota": str(fid), "tipo": "Peças", "valor": v})
         if not df_parada.empty:
             for fid, v in df_parada.groupby("id_frota")["_c_tot"].sum().items():
-                if v > 0:
+                if 0 < v < LIMITE_OUTLIER_CUSTO:
                     tm_rows.append({"frota": str(fid), "tipo": "Parada", "valor": v})
         if tm_rows:
             df_tm = pd.DataFrame(tm_rows)
@@ -823,29 +1136,34 @@ with tab3:
             )
             fig_tm.update_layout(**PDARK, height=320)
             st.plotly_chart(fig_tm, use_container_width=True, key="k_treemap")
+        else:
+            st.info("Sem custos rotineiros para treemap neste mês.")
 
     with ct2:
-        st.markdown('<div class="sec">Peças por sistema (OS)</div>', unsafe_allow_html=True)
-        if not df_os_m.empty and not df_pecas_m.empty:
-            merged = df_pecas_m.merge(
+        st.markdown('<div class="sec">Peças por sistema (OS rotineiras)</div>', unsafe_allow_html=True)
+        if not df_os_m.empty and not df_pecas_rot.empty:
+            merged = df_pecas_rot.merge(
                 df_os_m[["numero_os", "sistema"]].drop_duplicates(),
                 on="numero_os", how="left",
             )
             rs = merged.groupby("sistema")["custo_pecas"].sum().reset_index().sort_values("custo_pecas", ascending=True).tail(10)
-            fig_p = go.Figure(go.Bar(
-                y=rs["sistema"], x=rs["custo_pecas"], orientation="h",
-                marker_color="#2980b9",
-                text=rs["custo_pecas"].apply(fmtR), textposition="outside",
-                textfont=dict(color="#e8edd0"),
-            ))
-            fig_p.update_layout(**PDARK, height=320, xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS})
-            st.plotly_chart(fig_p, use_container_width=True, key="k_pecas_sis")
+            if not rs.empty and rs["custo_pecas"].sum() > 0:
+                fig_p = go.Figure(go.Bar(
+                    y=rs["sistema"], x=rs["custo_pecas"], orientation="h",
+                    marker_color="#2980b9",
+                    text=rs["custo_pecas"].apply(fmtR), textposition="outside",
+                    textfont=dict(color="#e8edd0"),
+                ))
+                fig_p.update_layout(**PDARK, height=320, xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS})
+                st.plotly_chart(fig_p, use_container_width=True, key="k_pecas_sis")
+            else:
+                st.info("Sem peças rotineiras por sistema.")
         else:
             st.info("Sem cruzamento OS × peças neste mês.")
 
-    if not df_pecas_m.empty:
-        st.markdown('<div class="sec">Detalhe peças por OS</div>', unsafe_allow_html=True)
-        det = df_pecas_m.sort_values("custo_pecas", ascending=False).head(25).copy()
+    if not df_pecas_rot.empty:
+        st.markdown('<div class="sec">Detalhe peças rotineiras por OS</div>', unsafe_allow_html=True)
+        det = df_pecas_rot.sort_values("custo_pecas", ascending=False).head(25).copy()
         det_show = pd.DataFrame({
             "OS": det["numero_os"],
             "Frota": det["id_frota"],
@@ -856,93 +1174,77 @@ with tab3:
         dark_table(det_show, height=380)
 
 # ══════════════════════════════════════════════════════════════
-# TAB 4 — POR PESSOA
+# TAB 4 — RANKING TRATORES
 # ══════════════════════════════════════════════════════════════
 with tab4:
-    st.markdown(f'<div class="sec">Custo por mecânico e operador · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sec">Ranking operacional · {fmt_mes_label(mes_sel)}</div>', unsafe_allow_html=True)
+    st.caption(
+        "Indicadores para reunião gerencial: horas operando, paradas por OS, "
+        "consumo Diesel S-500 aditivado e maior sequência de dias sem OS no mês."
+    )
 
-    if df_parada.empty:
-        st.info("Sem OS no mês para calcular custos por pessoa.")
-    elif df_colab.empty:
-        st.warning("Cadastre custo_hora em dim_colaborador para calcular os custos.")
+    if df_rank.empty:
+        st.warning("Sem apontamento no mês — verifique apontamento_campo.")
     else:
-        pm1, pm2, pm3 = st.columns(3)
-        pm1.metric("🔧 Custo mecânicos", fmtR(custo_parada_mec))
-        pm2.metric("👨‍🌾 Custo operadores", fmtR(custo_parada_op))
-        pm3.metric("⏱ Horas parada OS", f"{fmt(df_parada['_h'].sum(), 1)}h")
-
-        pp1, pp2 = st.columns(2)
-        with pp1:
-            st.markdown('<div class="sec">Top mecânicos · horas × custo/h</div>', unsafe_allow_html=True)
-            mec = df_parada[df_parada["_c_mec"] > 0].copy()
-            if not mec.empty:
-                rm = mec.groupby("mecanico").agg(
-                    horas=("_h", "sum"), custo=("_c_mec", "sum"), os=("numero_os", "count")
-                ).reset_index().sort_values("custo", ascending=True).tail(10)
-                fig_m = go.Figure()
-                fig_m.add_trace(go.Bar(
-                    y=rm["mecanico"], x=rm["horas"], name="Horas",
-                    orientation="h", marker_color="#4a9e3f",
-                    text=rm["horas"].apply(lambda v: f"{v:.1f}h"), textposition="inside",
-                ))
-                fig_m.add_trace(go.Scatter(
-                    y=rm["mecanico"], x=rm["custo"], name="R$ Custo",
-                    mode="markers+text",
-                    marker=dict(size=rm["custo"] / rm["custo"].max() * 30 + 8, color="#d4a017"),
-                    text=rm["custo"].apply(fmtR), textposition="middle right",
-                    textfont=dict(color="#e8edd0", size=10),
-                    xaxis="x2",
-                ))
-                fig_m.update_layout(
-                    **PDARK, height=320,
-                    xaxis={**PLOT_AXIS, "title": "Horas parada"},
-                    xaxis2={**PLOT_AXIS, "title": "R$", "overlaying": "x", "side": "top", "showgrid": False},
-                    yaxis={**PLOT_AXIS},
-                    legend=dict(orientation="h", y=1.08, font=dict(color="#e8edd0")),
-                )
-                st.plotly_chart(fig_m, use_container_width=True, key="k_mec")
-            else:
-                st.info("Sem custo de mecânico registrado.")
-
-        with pp2:
-            st.markdown('<div class="sec">Top operadores · máquina parada</div>', unsafe_allow_html=True)
-            op = df_parada[(df_parada["_c_op"] > 0) & (df_parada["_oper"] != "")].copy()
-            if not op.empty:
-                ro = op.groupby("_oper").agg(
-                    horas=("_h", "sum"), custo=("_c_op", "sum"), os=("numero_os", "count")
-                ).reset_index().sort_values("custo", ascending=True).tail(10)
-                ro["operador"] = ro["_oper"]
-                fig_o = go.Figure(go.Bar(
-                    y=ro["operador"], x=ro["custo"], orientation="h",
-                    marker_color="#2980b9",
-                    text=ro.apply(lambda r: f"{fmtR(r['custo'])} · {r['horas']:.1f}h", axis=1),
-                    textposition="outside", textfont=dict(color="#e8edd0", size=11),
-                ))
-                fig_o.update_layout(**PDARK, height=320, xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS})
-                st.plotly_chart(fig_o, use_container_width=True, key="k_oper")
-            else:
-                st.info("Sem custo de operador (implementos não têm operador próprio).")
-
-        st.markdown('<div class="sec">Radar · produtividade mecânicos (horas OS)</div>', unsafe_allow_html=True)
-        mec_radar = df_parada[df_parada["_c_mec"] > 0].copy()
-        if not mec_radar.empty:
-            rm_r = mec_radar.groupby("mecanico")["_h"].sum().reset_index().sort_values("_h", ascending=False).head(8)
-            fig_r = go.Figure(go.Scatterpolar(
-                r=rm_r["_h"].tolist(),
-                theta=rm_r["mecanico"].tolist(),
-                fill="toself",
-                fillcolor="rgba(74,158,63,0.3)",
-                line=dict(color="#4a9e3f", width=2),
-            ))
-            fig_r.update_layout(
-                **PDARK, height=340,
-                polar=dict(
-                    bgcolor="#0d180c",
-                    radialaxis=dict(visible=True, gridcolor="#1e2e1c", tickfont=dict(color="#8aab80")),
-                    angularaxis=dict(tickfont=dict(color="#e8edd0", size=11)),
-                ),
+        tem_s500 = df_rank["litros_s500"].sum() > 0
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            fig_r1 = chart_top5(
+                df_rank, "horas_trabalhadas",
+                "Top 5 · horas operando", "#4a9e3f",
+                lambda v: f"{v:.0f}h",
             )
-            st.plotly_chart(fig_r, use_container_width=True, key="k_radar")
+            if fig_r1:
+                st.plotly_chart(fig_r1, use_container_width=True, key="k_rank_op")
+        with r1c2:
+            fig_r2 = chart_top5(
+                df_rank[df_rank["horas_parada"] > 0],
+                "horas_parada",
+                "Top 5 · horas paradas (OS)", "#c0392b",
+                lambda v: f"{v:.0f}h",
+            )
+            if fig_r2:
+                st.plotly_chart(fig_r2, use_container_width=True, key="k_rank_par")
+
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            col_litros = "litros_s500" if tem_s500 else "litros"
+            titulo_lit = "Top 5 · Diesel S-500 aditivado" if tem_s500 else "Top 5 · litros abastecidos"
+            df_lit = df_rank[df_rank[col_litros] > 0]
+            fig_r3 = chart_top5(
+                df_lit, col_litros, titulo_lit, "#2980b9",
+                lambda v: f"{v:,.0f} L".replace(",", "."),
+            )
+            if fig_r3:
+                st.plotly_chart(fig_r3, use_container_width=True, key="k_rank_lit")
+            elif not tem_s500:
+                st.info("Sem detalhe S-500 — usando total de abastecimento na aba Combustível.")
+        with r2c2:
+            df_lin = df_rank[df_rank.get("horas_linear", 0) > 0] if "horas_linear" in df_rank.columns else pd.DataFrame()
+            fig_r4 = chart_top5(
+                df_lin, "horas_linear",
+                "Top 5 · operação linear (sem OS)", "#d4a017",
+                lambda v: f"{v:.0f}h",
+            )
+            if fig_r4:
+                st.plotly_chart(fig_r4, use_container_width=True, key="k_rank_lin")
+            else:
+                st.info("Sem sequência de dias sem OS neste mês.")
+
+        st.markdown('<div class="sec">Tabela consolidada · frota</div>', unsafe_allow_html=True)
+        tbl = df_rank.sort_values("horas_trabalhadas", ascending=False).head(20).copy()
+        tbl_show = pd.DataFrame({
+            "Trator": tbl["label"],
+            "H. Operando": tbl["horas_trabalhadas"].apply(lambda v: f"{v:.0f}h"),
+            "H. Paradas": tbl["horas_parada"].apply(lambda v: f"{v:.0f}h"),
+            "Disp. %": tbl["disponibilidade_pct"].apply(lambda v: f"{v:.1f}%"),
+            "Litros": tbl["litros"].apply(lambda v: f"{v:,.0f} L".replace(",", ".")),
+            "S-500": tbl["litros_s500"].apply(lambda v: f"{v:,.0f} L".replace(",", ".") if v > 0 else "—"),
+            "L/h": tbl["litros_h"].apply(lambda v: f"{v:.1f}" if v > 0 else "—"),
+            "Dias s/ OS": tbl.get("dias_linear", pd.Series(0, index=tbl.index)).apply(lambda v: f"{int(v)}" if v else "—"),
+            "Período linear": tbl.get("periodo", pd.Series("—", index=tbl.index)),
+        })
+        dark_table(tbl_show, height=420)
 
 # ══════════════════════════════════════════════════════════════
 # TAB 5 — ABASTECIMENTO × PRODUTIVIDADE
