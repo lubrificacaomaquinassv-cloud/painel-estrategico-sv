@@ -5,9 +5,10 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import unicodedata
 
-PAINEL_BUILD = "2026-07-24-periodo-maijunjul-v7"
+PAINEL_BUILD = "2026-07-24-sem-colheitadeira-v8"
 MES_INICIO_COLETA = "2026-05"  # início apontamento_campo
 LIMITE_OUTLIER_CUSTO = 50000.0  # ex.: motor R$ 91k — fora dos gráficos rotineiros
+BG_URL = "https://media.bio.site/sites/32a25c2c-d6fa-4dfc-bdc2-27e4d35d7ea2/AhS9mKiQxFRXAyMBdXDzEG.jpg"
 # Operação linear — só apontamento_campo (tempo real); exclui uso esporádico
 MIN_DIAS_APONT_MES = 8       # mín. dias com apontamento no mês
 MIN_HORAS_MES = 32           # mín. horas no mês
@@ -23,42 +24,46 @@ st.set_page_config(
     page_icon="📊",
 )
 
-st.markdown("""
+st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700&display=swap');
-[data-testid="stAppViewContainer"]{background:#0a1409;}
-[data-testid="stSidebar"]{background:#111c10;border-right:1px solid #1e2e1c;}
-[data-testid="stHeader"]{background:#0a1409;}
-h1,h2,h3,p,span,label{color:#e8edd0;}
-.stCaption,[data-testid="stCaptionContainer"] p{color:#8aab80!important;}
-.stMarkdown p,.stMarkdown li{color:#c8d8c0;}
-.stAlert p{color:#e8edd0!important;}
-.sec{font-family:'Barlow Condensed',sans-serif;font-size:12px;font-weight:700;
+.stApp{{
+ background:linear-gradient(rgba(10,20,9,0.84),rgba(10,20,9,0.93)),
+ url('{BG_URL}') center center/cover no-repeat fixed!important;
+}}
+[data-testid="stAppViewContainer"]{{background:transparent!important;}}
+[data-testid="stSidebar"]{{background:rgba(17,28,16,0.94)!important;border-right:1px solid #1e2e1c;}}
+[data-testid="stHeader"]{{background:rgba(10,20,9,0.85)!important;}}
+h1,h2,h3,p,span,label{{color:#e8edd0;}}
+.stCaption,[data-testid="stCaptionContainer"] p{{color:#8aab80!important;}}
+.stMarkdown p,.stMarkdown li{{color:#c8d8c0;}}
+.stAlert p{{color:#e8edd0!important;}}
+.sec{{font-family:'Barlow Condensed',sans-serif;font-size:12px;font-weight:700;
      letter-spacing:2px;text-transform:uppercase;color:#8aab80;
-     border-left:4px solid #4a9e3f;padding-left:10px;margin:18px 0 10px;}
-.stTabs [data-baseweb="tab-list"]{background:#111c10;border-bottom:2px solid #1e2e1c;gap:0;}
-.stTabs [data-baseweb="tab"]{color:#4a6644;font-family:'Barlow Condensed',sans-serif;
+     border-left:4px solid #4a9e3f;padding-left:10px;margin:18px 0 10px;}}
+.stTabs [data-baseweb="tab-list"]{{background:rgba(17,28,16,0.92);border-bottom:2px solid #1e2e1c;gap:0;}}
+.stTabs [data-baseweb="tab"]{{color:#4a6644;font-family:'Barlow Condensed',sans-serif;
      font-size:12px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-     padding:10px 20px;border-bottom:3px solid transparent;}
-.stTabs [aria-selected="true"]{color:#6fcf60!important;border-bottom:3px solid #4a9e3f!important;}
-div[data-testid="metric-container"]{background:#111c10;border:1px solid #1e2e1c;border-radius:10px;padding:14px;}
-div[data-testid="metric-container"] label{color:#8aab80!important;font-size:11px!important;}
-div[data-testid="metric-container"] [data-testid="stMetricValue"]{
- color:#e8edd0!important;font-size:1.25rem!important;white-space:normal!important;overflow:visible!important;}
-div[data-testid="metric-container"] [data-testid="stMetricDelta"]{color:#8aab80!important;font-size:11px!important;}
-.kpi-card{background:#111c10;border:1px solid #1e2e1c;border-radius:10px;padding:12px 14px;margin-bottom:8px;}
-.kpi-lab{font-family:'Barlow Condensed',sans-serif;font-size:11px;color:#8aab80;
- letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;}
-.kpi-val{font-family:'Barlow Condensed',sans-serif;font-size:1.45rem;font-weight:700;color:#e8edd0;
- line-height:1.2;word-break:break-word;}
-.kpi-sub{font-size:10px;color:#6fcf60;margin-top:4px;}
-div[data-testid="stSelectbox"] label,div[data-testid="stMultiSelect"] label{color:#8aab80!important;}
-div[data-testid="stSelectbox"] > div,div[data-testid="stMultiSelect"] > div{
- background:#111c10!important;border:1px solid #1e2e1c!important;color:#e8edd0!important;}
-.stButton button{background:#4a9e3f!important;color:#ffffff!important;border:1px solid #6fcf60!important;
- font-family:'Barlow Condensed',sans-serif;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-radius:8px;}
-.stButton button:hover{background:#3d8534!important;border-color:#9fe790!important;}
-.stButton button p{color:#ffffff!important;font-weight:700;}
+     padding:10px 20px;border-bottom:3px solid transparent;}}
+.stTabs [aria-selected="true"]{{color:#6fcf60!important;border-bottom:3px solid #4a9e3f!important;}}
+div[data-testid="metric-container"]{{background:rgba(17,28,16,0.92);border:1px solid #1e2e1c;border-radius:10px;padding:14px;}}
+div[data-testid="metric-container"] label{{color:#8aab80!important;font-size:11px!important;}}
+div[data-testid="metric-container"] [data-testid="stMetricValue"]{{
+ color:#e8edd0!important;font-size:1.25rem!important;white-space:normal!important;overflow:visible!important;}}
+div[data-testid="metric-container"] [data-testid="stMetricDelta"]{{color:#8aab80!important;font-size:11px!important;}}
+.kpi-card{{background:rgba(17,28,16,0.92);border:1px solid #1e2e1c;border-radius:10px;padding:12px 14px;margin-bottom:8px;}}
+.kpi-lab{{font-family:'Barlow Condensed',sans-serif;font-size:11px;color:#8aab80;
+ letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;}}
+.kpi-val{{font-family:'Barlow Condensed',sans-serif;font-size:1.45rem;font-weight:700;color:#e8edd0;
+ line-height:1.2;word-break:break-word;}}
+.kpi-sub{{font-size:10px;color:#6fcf60;margin-top:4px;}}
+div[data-testid="stSelectbox"] label,div[data-testid="stMultiSelect"] label{{color:#8aab80!important;}}
+div[data-testid="stSelectbox"] > div,div[data-testid="stMultiSelect"] > div{{
+ background:rgba(17,28,16,0.92)!important;border:1px solid #1e2e1c!important;color:#e8edd0!important;}}
+.stButton button{{background:#4a9e3f!important;color:#ffffff!important;border:1px solid #6fcf60!important;
+ font-family:'Barlow Condensed',sans-serif;font-weight:700;letter-spacing:1px;text-transform:uppercase;border-radius:8px;}}
+.stButton button:hover{{background:#3d8534!important;border-color:#9fe790!important;}}
+.stButton button p{{color:#ffffff!important;font-weight:700;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -263,6 +268,7 @@ def mapa_frota_painel(df_painel):
 
 
 def frota_uso_esporadico(frota, modelo="", categoria=""):
+    """Colheitadeiras e frotas sazonais — fora de horas, consumo e custos."""
     fid = str(frota or "").strip().upper()
     if fid in FROTA_USO_ESPORADICO:
         return True, "Frota sazonal (colheita)"
@@ -271,6 +277,43 @@ def frota_uso_esporadico(frota, modelo="", categoria=""):
     if "COLHEIT" in cat or "HARVEST" in mod or "COLHEIT" in mod or "COLHEDOR" in mod:
         return True, "Colheitadeira / uso esporádico"
     return False, ""
+
+
+def filtrar_frota_produtiva(df, df_painel=None, col_frota=None):
+    """Remove colheitadeiras de todos os cruzamentos (horas, consumo, MO, peças)."""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    out = df.copy()
+    pm = mapa_frota_painel(df_painel)
+    if col_frota is None:
+        col_frota = next((c for c in ("id_frota", "frota", "vehicle") if c in out.columns), None)
+    if not col_frota:
+        return out
+    keep = []
+    for _, row in out.iterrows():
+        fid = norm_frota_id(pd.Series([row[col_frota]])).iloc[0]
+        info = pm.get(str(fid), {})
+        modelo = row.get("modelo", info.get("modelo", ""))
+        cat = row.get("categoria_painel", info.get("categoria_painel", ""))
+        excl, _ = frota_uso_esporadico(fid, modelo, cat)
+        keep.append(not excl)
+    return out.loc[out.index[keep]].copy()
+
+
+def resumo_mes_from_disp(df_disp):
+    d = filtrar_meses_coleta(df_disp)
+    if d.empty:
+        return pd.DataFrame()
+    g = d.groupby("mes_key", as_index=False).agg(
+        horas_trabalhadas=("horas_trabalhadas", "sum"),
+        horas_parada=("horas_parada", "sum"),
+        disp_media_pct=("disponibilidade_pct", "mean"),
+        total_os=("total_os", "sum"),
+    )
+    for col in g.columns:
+        if col != "mes_key":
+            g[col] = pd.to_numeric(g[col], errors="coerce").fillna(0)
+    return g.sort_values("mes_key", ascending=False)
 
 
 def calc_operacao_linear_apontamento(df_apont, df_os, meses, df_painel=None, somente_elegiveis=True):
@@ -532,7 +575,11 @@ def montar_rank_tratores(df_disp_m, df_abast_m=None, df_abast_s500=None):
         lambda x: x["litros"] / x["horas_trabalhadas"] if x["horas_trabalhadas"] > 0 else 0,
         axis=1,
     )
-    return r
+    mask = ~r.apply(
+        lambda x: frota_uso_esporadico(x["id_frota"], x.get("modelo"), x.get("categoria_painel"))[0],
+        axis=1,
+    )
+    return r[mask].copy()
 
 
 def chart_top5(df, col, titulo, cor, fmt_fn=None, orientation="h"):
@@ -1088,8 +1135,20 @@ df_lanc = load_lancamentos(CACHE_KEY)
 df_abast = load_abast(CACHE_KEY)
 df_abast_det = load_abast_detalhe(CACHE_KEY)
 df_colab = load_colab(CACHE_KEY)
-df_apont = load_apont(CACHE_KEY)
 df_painel = load_frota_painel(CACHE_KEY)
+df_apont = load_apont(CACHE_KEY)
+
+# Excluir colheitadeiras / harvester de toda a análise (tratores produtivos)
+df_apont = filtrar_frota_produtiva(df_apont, df_painel, col_frota="frota")
+df_disp = filtrar_frota_produtiva(df_disp, df_painel)
+df_os = filtrar_frota_produtiva(df_os, df_painel)
+df_pecas = filtrar_frota_produtiva(df_pecas, df_painel)
+df_lanc = filtrar_frota_produtiva(df_lanc, df_painel)
+df_abast = filtrar_frota_produtiva(df_abast, df_painel)
+df_abast_det = filtrar_frota_produtiva(df_abast_det, df_painel)
+df_resumo = resumo_mes_from_disp(df_disp)
+if df_resumo.empty:
+    df_resumo = load_resumo_mes(CACHE_KEY)
 
 # ── SIDEBAR ───────────────────────────────────────────────────
 with st.sidebar:
@@ -1112,7 +1171,8 @@ with st.sidebar:
     )
     n_meses_trend = st.slider("Meses no gráfico de tendência", 3, 12, 6, key="n_trend")
     categorias = sorted(
-        {str(c) for c in df_disp["categoria_painel"].dropna().unique()}
+        {str(c) for c in df_disp["categoria_painel"].dropna().unique()
+         if "COLHEIT" not in str(c).upper()}
         if not df_disp.empty and "categoria_painel" in df_disp.columns
         else ["EQUIPAMENTO", "MAQUINA"]
     )
@@ -1124,7 +1184,7 @@ with st.sidebar:
     )
     st.caption(
         f"Coleta desde {fmt_mes_label(MES_INICIO_COLETA)} · "
-        f"Fonte: {DATA_MODE} · apontamento_campo + ordem_servico"
+        f"Colheitadeiras excluídas · tratores produtivos + MO mecânico"
     )
     trimestres_opts = periodos_resumo_disponiveis(meses_opts)
     if not trimestres_opts:
@@ -1248,7 +1308,8 @@ with tab1:
 
     st.caption(
         f"Base operacional desde {fmt_mes_label(MES_INICIO_COLETA)} — "
-        "custos extraordinários (ex.: motor) ficam na aba Financeiro, fora desta visão."
+        "somente tratores produtivos (colheitadeiras excluídas) · "
+        "horas lineares, consumo, MO mecânico."
     )
 
     ce1, ce2 = st.columns([1, 1.2])
