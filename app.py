@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import unicodedata
 
-PAINEL_BUILD = "2026-07-24-periodo-padrao-v9"
+PAINEL_BUILD = "2026-07-24-fix-litros-s500-v10"
 MES_INICIO_COLETA = "2026-05"  # início apontamento_campo
 LIMITE_OUTLIER_CUSTO = 50000.0  # ex.: motor R$ 91k — fora dos gráficos rotineiros
 BG_URL = "https://media.bio.site/sites/32a25c2c-d6fa-4dfc-bdc2-27e4d35d7ea2/AhS9mKiQxFRXAyMBdXDzEG.jpg"
@@ -561,16 +561,16 @@ def montar_rank_tratores(df_disp_m, df_abast_m=None, df_abast_s500=None):
             df_abast_m[["id_frota", "litros_total"]].rename(columns={"litros_total": "litros"}),
             on="id_frota", how="left",
         )
-    else:
+    elif "litros" not in r.columns:
         r["litros"] = 0.0
-    if df_abast_s500 is not None and not df_abast_s500.empty:
+    if df_abast_s500 is not None and not df_abast_s500.empty and "litros_s500" not in r.columns:
         r = r.merge(
             df_abast_s500[["id_frota", "litros_s500"]], on="id_frota", how="left",
         )
-    else:
+    if "litros_s500" not in r.columns:
         r["litros_s500"] = 0.0
-    r["litros"] = pd.to_numeric(r.get("litros", 0), errors="coerce").fillna(0)
-    r["litros_s500"] = pd.to_numeric(r.get("litros_s500", 0), errors="coerce").fillna(0)
+    r["litros"] = pd.to_numeric(r["litros"], errors="coerce").fillna(0)
+    r["litros_s500"] = pd.to_numeric(r["litros_s500"], errors="coerce").fillna(0)
     if r["litros"].sum() == 0 and r["litros_s500"].sum() > 0:
         r["litros"] = r["litros_s500"]
     r["litros_h"] = r.apply(
