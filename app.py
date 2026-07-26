@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import unicodedata
 
-PAINEL_BUILD = "2026-07-24-reuniao-exec-v11"
+PAINEL_BUILD = "2026-07-24-reuniao-exec-v12"
 MES_INICIO_COLETA = "2026-05"  # início apontamento_campo
 LIMITE_OUTLIER_CUSTO = 50000.0  # ex.: motor R$ 91k — fora dos gráficos rotineiros
 BG_URL = "https://media.bio.site/sites/32a25c2c-d6fa-4dfc-bdc2-27e4d35d7ea2/AhS9mKiQxFRXAyMBdXDzEG.jpg"
@@ -302,8 +302,14 @@ def filtrar_frota_produtiva(df, df_painel=None, col_frota=None):
 
 def disp_ponderada_pct(horas_trab, horas_par):
     """Disponibilidade = horas operando ÷ (operando + parada OS), ponderada por volume."""
-    ht = float(pd.to_numeric(horas_trab, errors="coerce").fillna(0).sum())
-    hp = float(pd.to_numeric(horas_par, errors="coerce").fillna(0).sum())
+    ht_s = pd.to_numeric(horas_trab, errors="coerce")
+    hp_s = pd.to_numeric(horas_par, errors="coerce")
+    if isinstance(ht_s, pd.Series):
+        ht = float(ht_s.fillna(0).sum())
+        hp = float(hp_s.fillna(0).sum())
+    else:
+        ht = float(ht_s) if pd.notna(ht_s) else 0.0
+        hp = float(hp_s) if pd.notna(hp_s) else 0.0
     denom = ht + hp
     return (ht / denom * 100) if denom > 0 else 0.0
 
@@ -317,9 +323,10 @@ def resumo_mes_from_disp(df_disp):
         horas_parada=("horas_parada", "sum"),
         total_os=("total_os", "sum"),
     )
-    g["disp_media_pct"] = g.apply(
-        lambda r: disp_ponderada_pct(r["horas_trabalhadas"], r["horas_parada"]), axis=1,
-    )
+    denom = g["horas_trabalhadas"] + g["horas_parada"]
+    g["disp_media_pct"] = (
+        g["horas_trabalhadas"] / denom.replace(0, pd.NA) * 100
+    ).fillna(0)
     for col in g.columns:
         if col != "mes_key":
             g[col] = pd.to_numeric(g[col], errors="coerce").fillna(0)
