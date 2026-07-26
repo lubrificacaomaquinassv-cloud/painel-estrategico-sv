@@ -5,7 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import unicodedata
 
-PAINEL_BUILD = "2026-07-24-fix-litros-s500-v10"
+PAINEL_BUILD = "2026-07-24-reuniao-exec-v11"
 MES_INICIO_COLETA = "2026-05"  # início apontamento_campo
 LIMITE_OUTLIER_CUSTO = 50000.0  # ex.: motor R$ 91k — fora dos gráficos rotineiros
 BG_URL = "https://media.bio.site/sites/32a25c2c-d6fa-4dfc-bdc2-27e4d35d7ea2/AhS9mKiQxFRXAyMBdXDzEG.jpg"
@@ -300,6 +300,14 @@ def filtrar_frota_produtiva(df, df_painel=None, col_frota=None):
     return out.loc[out.index[keep]].copy()
 
 
+def disp_ponderada_pct(horas_trab, horas_par):
+    """Disponibilidade = horas operando ÷ (operando + parada OS), ponderada por volume."""
+    ht = float(pd.to_numeric(horas_trab, errors="coerce").fillna(0).sum())
+    hp = float(pd.to_numeric(horas_par, errors="coerce").fillna(0).sum())
+    denom = ht + hp
+    return (ht / denom * 100) if denom > 0 else 0.0
+
+
 def resumo_mes_from_disp(df_disp):
     d = filtrar_meses_coleta(df_disp)
     if d.empty:
@@ -307,8 +315,10 @@ def resumo_mes_from_disp(df_disp):
     g = d.groupby("mes_key", as_index=False).agg(
         horas_trabalhadas=("horas_trabalhadas", "sum"),
         horas_parada=("horas_parada", "sum"),
-        disp_media_pct=("disponibilidade_pct", "mean"),
         total_os=("total_os", "sum"),
+    )
+    g["disp_media_pct"] = g.apply(
+        lambda r: disp_ponderada_pct(r["horas_trabalhadas"], r["horas_parada"]), axis=1,
     )
     for col in g.columns:
         if col != "mes_key":
@@ -1252,7 +1262,7 @@ with st.sidebar:
     cat_sel = st.multiselect(
         "Categorias de frota",
         options=categorias,
-        default=[c for c in categorias if c in ("EQUIPAMENTO", "MAQUINA", "OUTRO")][:3] or categorias[:2],
+        default=categorias,
         key="cat_sel",
     )
     st.caption(
@@ -1280,7 +1290,10 @@ df_disp_m, df_os_m, df_pecas_m, df_lanc_m, df_abast_m, df_abast_s500_m = prep_da
 df_parada = calc_parada_os(df_os_m, df_colab, df_apont) if not df_os_m.empty else pd.DataFrame()
 
 # KPIs do escopo (mês ou período)
-disp_media = df_disp_m["disponibilidade_pct"].mean() if not df_disp_m.empty else 0
+disp_media = disp_ponderada_pct(
+    df_disp_m["horas_trabalhadas"], df_disp_m["horas_parada"],
+) if not df_disp_m.empty else 0
+lbl_horas_eixo = "Horas no período" if escopo_periodo else "Horas no mês"
 ht = df_disp_m["horas_trabalhadas"].sum() if not df_disp_m.empty else 0
 hp = df_disp_m["horas_parada"].sum() if not df_disp_m.empty else 0
 custo_pecas = df_pecas_m["custo_pecas"].sum() if not df_pecas_m.empty else 0
@@ -1365,7 +1378,7 @@ with tab1:
     st.markdown(f'<div class="sec">Indicadores estratégicos · {titulo_periodo}</div>', unsafe_allow_html=True)
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("📊 Disponibilidade", f"{disp_media:.1f}%")
+    k1.metric("📊 Disponibilidade", f"{disp_media:.1f}%", help="Ponderada por horas (operando ÷ operando+parada).")
     k2.metric("⚙️ H. Operando", f"{fmt(ht)}h")
     k3.metric("🔴 H. Paradas", f"{fmt(hp)}h")
     k4.metric("🔧 OS" + (" no período" if escopo_periodo else " no mês"), int(n_os_escopo))
@@ -1418,7 +1431,7 @@ with tab1:
             fig_trend = go.Figure()
             fig_trend.add_trace(go.Scatter(
                 x=trend["mes_label"], y=trend["disp_media_pct"],
-                name="Disponib. %", mode="lines+markers",
+                name="Disp. % (pond.)", mode="lines+markers",
                 line=dict(color="#4a9e3f", width=3), marker=dict(size=8),
             ))
             fig_trend.add_trace(go.Scatter(
@@ -1436,28 +1449,36 @@ with tab1:
             fig_trend.update_layout(
                 **PDARK, height=320,
                 xaxis={**PLOT_AXIS},
-                yaxis={**PLOT_AXIS, "title": "Disponib. %", "range": [0, 100]},
-                yaxis2={**PLOT_AXIS, "title": "Horas", "overlaying": "y", "side": "right"},
+                yaxis={**PLOT_AXIS, "title": "Disp. % (pond.)", "range": [0, 100]},
+                yaxis2={**PLOT_AXIS, "title": "Horas (frota)", "overlaying": "y", "side": "right"},
                 legend=dict(orientation="h", y=1.12, font=dict(color="#e8edd0")),
+            )
+            st.caption(
+                "Disponibilidade ponderada por horas · linhas azul/vermelho = totais da frota no mês."
             )
             st.plotly_chart(fig_trend, use_container_width=True, key="k_trend")
     else:
         st.info("Sem resumo mensal — rode as views SQL no Supabase.")
 
     if not df_rank.empty:
-        st.markdown(f'<div class="sec">Resumo Top 5 · {titulo_periodo}</div>', unsafe_allow_html=True)
-        cols_rank = st.columns(4)
-        for i, (titulo, col, fn) in enumerate([
+        st.markdown(f'<div class="sec">Líder da frota · {titulo_periodo}</div>', unsafe_allow_html=True)
+        st.caption(
+            f"Equipamento #1 em cada indicador — totais da frota: {fmt(ht)}h operando · "
+            f"{fmt(litros)} L · {litros/ht:.1f} L/h" if ht > 0 and litros > 0 else
+            f"Equipamento #1 em cada indicador — total da frota: {fmt(ht)}h operando."
+        )
+        cards_lider = []
+        for titulo, col, fn in [
             ("⚙️ Operando", "horas_trabalhadas", lambda v: f"{v:.0f}h"),
             ("🔴 Paradas", "horas_parada", lambda v: f"{v:.0f}h"),
-            ("⛽ Litros", "litros", lambda v: f"{v:,.0f} L"),
+            ("⛽ Litros", "litros", lambda v: f"{v:,.0f} L".replace(",", ".")),
             ("📈 L/h", "litros_h", lambda v: f"{v:.1f}"),
-        ]):
+        ]:
             top1 = df_rank.nlargest(1, col)
-            with cols_rank[i]:
-                if not top1.empty:
-                    lc = top1.iloc[0].get("label_curto") or label_curto(top1.iloc[0])
-                    st.metric(titulo, fn(top1.iloc[0][col]), lc)
+            if not top1.empty and float(top1.iloc[0][col] or 0) > 0:
+                lc = top1.iloc[0].get("label_curto") or label_curto(top1.iloc[0])
+                cards_lider.append((titulo, fn(top1.iloc[0][col]), f"Líder · {lc}"))
+        kpi_grid(cards_lider, cols=4)
 
 # ══════════════════════════════════════════════════════════════
 # TAB PERÍODO MAI–JUN–JUL
@@ -1489,7 +1510,7 @@ with tab_tri:
             ("⛽ S-500 adit.", f"{fmt(litros_s500_tri)} L" if litros_s500_tri > 0 else "—", s500_sub if litros_s500_tri > 0 else ""),
         ], cols=3)
         kpi_grid([
-            ("📊 Disp. média", f"{df_frota_tri['disponibilidade_pct'].mean():.1f}%", "média frota"),
+            ("📊 Disponibilidade", f"{disp_ponderada_pct(df_frota_tri['horas_trabalhadas'], df_frota_tri['horas_parada']):.1f}%", "ponderada por horas"),
             ("🔧 OS", f"{int(df_frota_tri['total_os'].sum())}", "no período"),
             ("🏆 Lineares", f"{len(df_linear_tri)}", f"≥{MIN_DIAS_SEQ_LINEAR}d sem OS"),
         ], cols=3)
@@ -1694,29 +1715,33 @@ with tab2:
             fig.update_layout(
                 **PDARK, barmode="stack", height=max(320, len(dd) * 28),
                 legend=dict(orientation="h", y=1.05, font=dict(color="#e8edd0")),
-                xaxis={**PLOT_AXIS, "title": "Horas no mês"},
+                xaxis={**PLOT_AXIS, "title": lbl_horas_eixo},
                 yaxis={**PLOT_AXIS},
             )
             st.plotly_chart(fig, use_container_width=True, key="k_stack_h")
 
         with h2:
-            dd2 = df_disp_m.sort_values("disponibilidade_pct", ascending=True)
-            cores = dd2["disponibilidade_pct"].apply(
-                lambda v: "#c0392b" if v < 70 else "#d4a017" if v < 85 else "#4a9e3f"
-            )
-            fig2 = go.Figure(go.Bar(
-                y=dd2["label"], x=dd2["disponibilidade_pct"],
-                orientation="h", marker_color=cores.tolist(),
-                text=dd2["disponibilidade_pct"].apply(lambda v: f"{v:.1f}%"),
-                textposition="outside", textfont=dict(color="#e8edd0"),
-            ))
-            fig2.add_vline(x=85, line_color="#4a9e3f", line_dash="dot")
-            fig2.add_vline(x=70, line_color="#c0392b", line_dash="dash")
-            fig2.update_layout(
-                **PDARK, height=max(320, len(dd2) * 28),
-                xaxis_range=[0, 115], xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS},
-            )
-            st.plotly_chart(fig2, use_container_width=True, key="k_disp_bar")
+            dd2 = df_disp_m[df_disp_m["horas_trabalhadas"] > 0].sort_values("disponibilidade_pct", ascending=True)
+            if dd2.empty:
+                st.info("Sem frotas com horas operando no escopo selecionado.")
+            else:
+                cores = dd2["disponibilidade_pct"].apply(
+                    lambda v: "#c0392b" if v < 70 else "#d4a017" if v < 85 else "#4a9e3f"
+                )
+                fig2 = go.Figure(go.Bar(
+                    y=dd2["label"], x=dd2["disponibilidade_pct"],
+                    orientation="h", marker_color=cores.tolist(),
+                    text=dd2["disponibilidade_pct"].apply(lambda v: f"{v:.1f}%"),
+                    textposition="outside", textfont=dict(color="#e8edd0"),
+                ))
+                fig2.add_vline(x=85, line_color="#4a9e3f", line_dash="dot")
+                fig2.add_vline(x=70, line_color="#c0392b", line_dash="dash")
+                fig2.update_layout(
+                    **PDARK, height=max(320, len(dd2) * 28),
+                    xaxis_range=[0, 115], xaxis={**PLOT_AXIS}, yaxis={**PLOT_AXIS},
+                )
+                st.caption("Somente frotas com horas operando > 0 · linha tracejada = meta 85%.")
+                st.plotly_chart(fig2, use_container_width=True, key="k_disp_bar")
 
         # Heatmap frota x mes
         if not df_disp.empty:
@@ -1769,7 +1794,10 @@ with tab3:
     c3.metric("📄 NF-e rotineiras", fmtR(custo_lanc_rot))
     c4.metric("⏱ Custo parada", fmtR(custo_parada_tot))
     c5.metric("⚠️ Extraordinários", fmtR(custo_extra))
-    c6.metric("💰 Total mês", fmtR(custo_pecas + custo_mo + custo_lanc + custo_parada_tot))
+    c6.metric(
+        "💰 Total" + (" período" if escopo_periodo else " mês"),
+        fmtR(custo_pecas + custo_mo + custo_lanc + custo_parada_tot),
+    )
 
     if not df_extra_custos.empty:
         st.markdown('<div class="sec">Eventos extraordinários do mês</div>', unsafe_allow_html=True)
@@ -1923,6 +1951,11 @@ with tab5:
     ab1.metric("⛽ Litros abastecidos", f"{fmt(litros)} L")
     ab2.metric("⚙️ Horas operando", f"{fmt(ht)}h")
     ab3.metric("📈 L/h produtividade", f"{litros/ht:.1f} L/h" if ht > 0 else "—")
+
+    st.caption(
+        f"Totais da frota no {titulo_periodo.lower()} · cor = disponibilidade · "
+        "bolhas acima da diagonal = consumo acima da média."
+    )
 
     cruz = cruzamento_combustivel(df_disp_m, df_abast_m)
     if not cruz.empty:
