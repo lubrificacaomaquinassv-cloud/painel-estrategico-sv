@@ -1251,7 +1251,7 @@ with st.sidebar:
     mes_sel = st.selectbox(
         "Mês de referência",
         options=meses_opts,
-        index=0,
+        index=len(meses_opts) - 1 if meses_opts else 0,
         format_func=fmt_mes_label,
         key="mes_sel",
     )
